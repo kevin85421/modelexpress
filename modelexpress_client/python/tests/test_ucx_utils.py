@@ -100,33 +100,40 @@ def _install_fake_topology(monkeypatch, gpus, nics, visible=None):
 
 
 def test_flat_topology_selection_keeps_gpus_on_local_nics(monkeypatch):
-    gpus = {
-        gpu: (
-            f"000{2 + gpu // 4}:00:{1 + gpu % 4:02x}.0",
-            gpu // 4,
-            [
-                f"pci000{2 + gpu // 4}:00",
-                f"000{2 + gpu // 4}:00:{1 + gpu % 4:02x}.0",
-            ],
-        )
-        for gpu in range(8)
-    }
+    """Flat tree, 8 GPUs and 8 NICs, no NUMA: every GPU stays on its own root.
+
+    The paths are built by the real ``_pci_path_components`` from a fake sysfs
+    realpath, so this guards the root-complex retention rather than the ranking
+    of hand-written lists. NUMA is withheld (-1 everywhere) on purpose: with it
+    readable the cross-socket tiebreak would rescue the old scoring, and the
+    test would pass on the code this fixes.
+    """
+    sysfs: dict[str, str] = {}
+
+    def flat_device(domain: int, slot: int) -> str:
+        bdf = f"000{domain}:00:{slot:02x}.0"
+        sysfs[bdf] = f"/sys/devices/pci000{domain}:00/{bdf}"
+        return bdf
+
+    gpu_bdfs = [flat_device(2 + gpu // 4, 1 + gpu % 4) for gpu in range(8)]
+    nic_bdfs = [flat_device(2 + nic // 4, 9 + nic % 4) for nic in range(8)]
+    monkeypatch.setattr(
+        ucx_utils.os.path, "realpath", lambda path: sysfs[path.rsplit("/", 1)[-1]]
+    )
+    components = ucx_utils._pci_path_components
+
+    gpus = {gpu: (bdf, -1, components(bdf)) for gpu, bdf in enumerate(gpu_bdfs)}
     nics = [
-        (
-            f"mlx5_{5 + nic}",
-            nic // 4,
-            400.0,
-            [
-                f"pci000{2 + nic // 4}:00",
-                f"000{2 + nic // 4}:00:{9 + nic % 4:02x}.0",
-            ],
-        )
-        for nic in range(8)
+        (f"mlx5_{5 + nic}", -1, 400.0, components(bdf))
+        for nic, bdf in enumerate(nic_bdfs)
     ]
     _install_fake_topology(monkeypatch, gpus, nics)
 
     chosen = {gpu: ucx_utils.probe_nic_pin_for_device(gpu) for gpu in gpus}
 
+    # Within a root complex every NIC ties, and the final tiebreak is a plain
+    # string sort, where "mlx5_10" < "mlx5_9". GPU 4 therefore takes mlx5_10
+    # and GPU 7 is left mlx5_9; that is the deterministic order, not a bug.
     assert chosen == {
         0: "mlx5_5:1",
         1: "mlx5_6:1",
@@ -145,19 +152,36 @@ def test_flat_topology_selection_keeps_gpus_on_local_nics(monkeypatch):
 # The paths matter as much as the NUMA numbers, and are the real measured ones.
 # Only GPU3 shares a component with mlx5_11; GPU0/1/2 share nothing with any
 # rail and so score 0 against all four, including the same-socket one. The
-# omitted root-complex components are distinct for those pairs, so retaining
-# them in production does not change these nested-topology common depths.
+# root-complex components (``pci0000:xx``) are kept, as ``_pci_path_components``
+# returns them, and on this host every device sits under its own root bus, so
+# they add depth only where a deeper component was already shared.
 _MISAFFINE_GPUS = {
-    0: ("0000:9a:00.0", 1, ["0000:97:01.0", "0000:98:00.0", "0000:9a:00.0"]),
-    1: ("0000:aa:00.0", 1, ["0000:a7:01.0", "0000:a8:00.0", "0000:aa:00.0"]),
-    2: ("0000:ba:00.0", 1, ["0000:b7:01.0", "0000:b8:00.0", "0000:ba:00.0"]),
-    3: ("0000:ca:00.0", 1, ["0000:c7:01.0", "0000:c8:00.0", "0000:ca:00.0"]),
+    0: (
+        "0000:9a:00.0",
+        1,
+        ["pci0000:97", "0000:97:01.0", "0000:98:00.0", "0000:9a:00.0"],
+    ),
+    1: (
+        "0000:aa:00.0",
+        1,
+        ["pci0000:a7", "0000:a7:01.0", "0000:a8:00.0", "0000:aa:00.0"],
+    ),
+    2: (
+        "0000:ba:00.0",
+        1,
+        ["pci0000:b7", "0000:b7:01.0", "0000:b8:00.0", "0000:ba:00.0"],
+    ),
+    3: (
+        "0000:ca:00.0",
+        1,
+        ["pci0000:c7", "0000:c7:01.0", "0000:c8:00.0", "0000:ca:00.0"],
+    ),
 }
 _MISAFFINE_NICS = [
-    ("mlx5_0", 0, 400.0, ["0000:15:01.0", "0000:19:00.0"]),
-    ("mlx5_1", 0, 400.0, ["0000:26:01.0", "0000:2a:00.0"]),
-    ("mlx5_11", 1, 400.0, ["0000:c7:01.0", "0000:cb:00.0"]),
-    ("mlx5_2", 0, 400.0, ["0000:37:01.0", "0000:3b:00.0"]),
+    ("mlx5_0", 0, 400.0, ["pci0000:15", "0000:15:01.0", "0000:19:00.0"]),
+    ("mlx5_1", 0, 400.0, ["pci0000:26", "0000:26:01.0", "0000:2a:00.0"]),
+    ("mlx5_11", 1, 400.0, ["pci0000:c7", "0000:c7:01.0", "0000:cb:00.0"]),
+    ("mlx5_2", 0, 400.0, ["pci0000:37", "0000:37:01.0", "0000:3b:00.0"]),
 ]
 
 
@@ -324,24 +348,56 @@ def test_a_lone_same_socket_rail_is_not_handed_to_everyone(monkeypatch):
 # Same cluster, node th9sn: the allocation the scheduler is supposed to produce,
 # with one PCIe-affine rail per GPU spread across both sockets.
 _AFFINE_GPUS = {
-    0: ("0000:18:00.0", 0, ["0000:15:01.0", "0000:16:00.0", "0000:18:00.0"]),
-    1: ("0000:29:00.0", 0, ["0000:26:01.0", "0000:27:00.0", "0000:29:00.0"]),
-    2: ("0000:3a:00.0", 0, ["0000:37:01.0", "0000:38:00.0", "0000:3a:00.0"]),
-    3: ("0000:4b:00.0", 0, ["0000:48:01.0", "0000:49:00.0", "0000:4b:00.0"]),
-    4: ("0000:9a:00.0", 1, ["0000:97:01.0", "0000:98:00.0", "0000:9a:00.0"]),
-    5: ("0000:aa:00.0", 1, ["0000:a7:01.0", "0000:a8:00.0", "0000:aa:00.0"]),
-    6: ("0000:ba:00.0", 1, ["0000:b7:01.0", "0000:b8:00.0", "0000:ba:00.0"]),
-    7: ("0000:ca:00.0", 1, ["0000:c7:01.0", "0000:c8:00.0", "0000:ca:00.0"]),
+    0: (
+        "0000:18:00.0",
+        0,
+        ["pci0000:15", "0000:15:01.0", "0000:16:00.0", "0000:18:00.0"],
+    ),
+    1: (
+        "0000:29:00.0",
+        0,
+        ["pci0000:26", "0000:26:01.0", "0000:27:00.0", "0000:29:00.0"],
+    ),
+    2: (
+        "0000:3a:00.0",
+        0,
+        ["pci0000:37", "0000:37:01.0", "0000:38:00.0", "0000:3a:00.0"],
+    ),
+    3: (
+        "0000:4b:00.0",
+        0,
+        ["pci0000:48", "0000:48:01.0", "0000:49:00.0", "0000:4b:00.0"],
+    ),
+    4: (
+        "0000:9a:00.0",
+        1,
+        ["pci0000:97", "0000:97:01.0", "0000:98:00.0", "0000:9a:00.0"],
+    ),
+    5: (
+        "0000:aa:00.0",
+        1,
+        ["pci0000:a7", "0000:a7:01.0", "0000:a8:00.0", "0000:aa:00.0"],
+    ),
+    6: (
+        "0000:ba:00.0",
+        1,
+        ["pci0000:b7", "0000:b7:01.0", "0000:b8:00.0", "0000:ba:00.0"],
+    ),
+    7: (
+        "0000:ca:00.0",
+        1,
+        ["pci0000:c7", "0000:c7:01.0", "0000:c8:00.0", "0000:ca:00.0"],
+    ),
 }
 _AFFINE_NICS = [
-    ("mlx5_0", 0, 400.0, ["0000:15:01.0", "0000:19:00.0"]),
-    ("mlx5_1", 0, 400.0, ["0000:26:01.0", "0000:2a:00.0"]),
-    ("mlx5_10", 1, 400.0, ["0000:b7:01.0", "0000:bc:00.0"]),
-    ("mlx5_11", 1, 400.0, ["0000:c7:01.0", "0000:cb:00.0"]),
-    ("mlx5_2", 0, 400.0, ["0000:37:01.0", "0000:3b:00.0"]),
-    ("mlx5_3", 0, 400.0, ["0000:48:01.0", "0000:4c:00.0"]),
-    ("mlx5_4", 1, 400.0, ["0000:97:01.0", "0000:9b:00.0"]),
-    ("mlx5_5", 1, 400.0, ["0000:a7:01.0", "0000:ab:00.0"]),
+    ("mlx5_0", 0, 400.0, ["pci0000:15", "0000:15:01.0", "0000:19:00.0"]),
+    ("mlx5_1", 0, 400.0, ["pci0000:26", "0000:26:01.0", "0000:2a:00.0"]),
+    ("mlx5_10", 1, 400.0, ["pci0000:b7", "0000:b7:01.0", "0000:bc:00.0"]),
+    ("mlx5_11", 1, 400.0, ["pci0000:c7", "0000:c7:01.0", "0000:cb:00.0"]),
+    ("mlx5_2", 0, 400.0, ["pci0000:37", "0000:37:01.0", "0000:3b:00.0"]),
+    ("mlx5_3", 0, 400.0, ["pci0000:48", "0000:48:01.0", "0000:4c:00.0"]),
+    ("mlx5_4", 1, 400.0, ["pci0000:97", "0000:97:01.0", "0000:9b:00.0"]),
+    ("mlx5_5", 1, 400.0, ["pci0000:a7", "0000:a7:01.0", "0000:ab:00.0"]),
 ]
 
 
@@ -380,8 +436,8 @@ def test_more_gpus_than_rails_balances_reuse(monkeypatch):
     case, just without a same-socket rail to blame it on.
     """
     nics = [
-        ("mlx5_0", 0, 400.0, ["0000:15:01.0", "0000:19:00.0"]),
-        ("mlx5_11", 1, 400.0, ["0000:c7:01.0", "0000:cb:00.0"]),
+        ("mlx5_0", 0, 400.0, ["pci0000:15", "0000:15:01.0", "0000:19:00.0"]),
+        ("mlx5_11", 1, 400.0, ["pci0000:c7", "0000:c7:01.0", "0000:cb:00.0"]),
     ]
     _install_fake_topology(monkeypatch, _AFFINE_GPUS, nics)
 
@@ -399,10 +455,10 @@ def test_unknown_numa_does_not_override_pcie_affinity(monkeypatch):
     Kernels report -1 when NUMA is unknown, which is absence of information
     rather than evidence of a bad path, so PCIe depth must still decide.
     """
-    gpus = {0: ("0000:9a:00.0", 1, ["0000:97:01.0", "0000:9a:00.0"])}
+    gpus = {0: ("0000:9a:00.0", 1, ["pci0000:97", "0000:97:01.0", "0000:9a:00.0"])}
     nics = [
-        ("mlx5_4", -1, 400.0, ["0000:97:01.0", "0000:9b:00.0"]),
-        ("mlx5_11", 1, 400.0, ["0000:c7:01.0", "0000:cb:00.0"]),
+        ("mlx5_4", -1, 400.0, ["pci0000:97", "0000:97:01.0", "0000:9b:00.0"]),
+        ("mlx5_11", 1, 400.0, ["pci0000:c7", "0000:c7:01.0", "0000:cb:00.0"]),
     ]
     _install_fake_topology(monkeypatch, gpus, nics)
 
